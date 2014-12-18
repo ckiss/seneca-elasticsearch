@@ -229,7 +229,7 @@ function search(options, register) {
     esClient.search(args.request, cb);
   }
 
-	function fetchEntitiesFromDB(esResults, statusCode, cb) {
+	function fetchEntitiesFromDB(args, esResults, statusCode, cb) {
 		var seneca = this;
 		if(esResults && esResults.hits && esResults.hits.hits && esResults.hits.hits.length > 0) {
 			var hits = esResults.hits.hits;
