@@ -12,11 +12,22 @@ var indexName = 'seneca-test-entity';
 
 seneca.use('mem-store');
 
-seneca.use('..', {
+seneca.use('../elasticsearch.js', {
   refreshOnSave: true,
-  entities: {
-    foo: ['jobTitle']
-  },
+  entities: [{
+    zone: undefined,
+    base: undefined,
+    name: 'foo',
+    indexedAttributes: {
+      'jobTitle': {
+        type: 'string'
+      },
+      'configuredAnalyzer': {
+        type: 'string',
+        index: 'not_analyzed'
+      }
+    }
+  }],
   connection: { index: indexName }
 });
 
@@ -39,7 +50,7 @@ describe('entities', function() {
 
   it('should save entity', function(done) {
     foo.save$(function(err, result) {
-      if (err) { return seneca.fail(err); }
+      assert.ok(!err, err);
 
       fooId = result.id;
       done(null);
@@ -51,7 +62,7 @@ describe('entities', function() {
     foo.id$ = fooId;
 
     foo.save$(function(err, result) {
-      if (err) { return seneca.fail(err); }
+      assert.ok(!err, err);
 
       assert.equal(fooId, result.id);
       done(null);
@@ -71,6 +82,7 @@ describe('entities', function() {
         type: 'foo',
         id: fooId
       };
+
       seneca.act(command, loadCb);
     }
 
@@ -97,6 +109,69 @@ describe('entities', function() {
 
   it('should not error when removing a non-existent entity', function(done) {
     foo.remove$(fooId, throwOnError(done));
+  });
+
+  describe('configured analyzer', function() {
+    var foo = seneca.make$('foo');
+    before(function(done) {
+      foo.jobTitle = 'important sounding title';
+      foo.configuredAnalyzer = 'DO NOT ANALYZE';
+      seneca.ready(done);
+    });
+    it('should save entity', function(done) {
+      foo.save$(function(err, result) {
+        assert.ok(!err, err);
+
+        fooId = result.id;
+        done(null);
+      });
+    });
+
+
+    it('load', function(done) {
+
+      // need to debounce for 50ms to let the data get indexed.
+      _.delay(delayCb, 50);
+
+      function delayCb() {
+        var command = {
+          role: 'search',
+          cmd: 'search',
+          index: indexName,
+          type: 'foo',
+          search: {
+            "query": {
+              "filtered": {
+                "query": {
+                  "match_all": {}
+                },
+                "filter": {
+                  "term": {
+                    "configuredAnalyzer": "DO NOT ANALYZE"
+                  }
+                }
+              }
+            }
+          }
+        };
+
+        seneca.act(command, loadCb);
+      }
+
+      function loadCb(err, resp) {
+        if (err) { return done(err); }
+        should.exist(resp.hits);
+        resp.hits.total.should.eql(1);
+
+        var src = resp.hits.hits[0]._source;
+        src.jobTitle.should.eql('important sounding title');
+        src.configuredAnalyzer.should.eql('DO NOT ANALYZE');
+        should.not.exist(src.passHash);
+        should.not.exist(src.id);
+        should.not.exist(src.entity$);
+        done();
+      }
+    });
   });
 
 });

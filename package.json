@@ -1,6 +1,6 @@
 {
   "name": "seneca-elasticsearch",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "description": "elasticsearch plugin for seneca",
   "main": "elasticsearch.js",
   "scripts": {
@@ -26,6 +26,7 @@
     "elastic.js": "1.1.1",
     "elasticsearch": "2.1.0",
     "node-uuid": "1.4.1",
+    "serial": "0.0.6",
     "underscore": "1.6.0"
   },
   "peerDependencies": {

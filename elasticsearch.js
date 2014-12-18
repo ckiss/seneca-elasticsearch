@@ -1,14 +1,15 @@
 /* jshint indent: 2, asi: true */
 // vim: noai:ts=2:sw=2
 
-var pluginName    = 'search'
+var pluginName      = 'search'
 
-var _             = require('underscore');
-var assert        = require('assert');
-var async         = require('async');
-var elasticsearch = require('elasticsearch');
-var ejs           = require('elastic.js');
-var uuid          = require('node-uuid');
+var _               = require('underscore');
+var assert          = require('assert');
+var async           = require('async');
+var ParallelRunner  = require('serial').ParallelRunner;
+var elasticsearch   = require('elasticsearch');
+var ejs             = require('elastic.js');
+var uuid            = require('node-uuid');
 
 function search(options, register) {
   var options = options || {};
@@ -16,7 +17,7 @@ function search(options, register) {
 
   // Apply defaults individually,
   // instead of all-or-nothing.
-  var connectionOptions = _.extend({}, options.connection, {});
+  var connectionOptions = options.connection || {};
 
 
   _.defaults(connectionOptions, {
@@ -27,18 +28,47 @@ function search(options, register) {
     log           : 'error'
   });
 
+  connectionOptions = _.clone(connectionOptions);
   var esClient = new elasticsearch.Client(connectionOptions);
 
-  /**
-  * Seneca bindings.
-  *
-  * We compose what needs to happen during the events
-  * using async.seq, which nests the calls the functions
-  * in order, passing the same context to all of them.
-  */
+  var entitiesConfig = {};
+  if(options.entities) {
+    for(var i = 0 ; i < options.entities.length ; i++) {
+      var entitySettings = options.entities[i];
+      var esEntityName = entityNameFromObj(entitySettings);
+      var config = entitiesConfig[esEntityName] = {};
+      if(entitySettings.indexedAttributes) {
+        config.indexedAttributes = Object.keys(entitySettings.indexedAttributes);
+        config.mapping = entitySettings.indexedAttributes;
+      }
+    }
+  }
 
-  // startup
-  seneca.add({init: pluginName}, ensureIndex);
+  /**
+   * Seneca bindings.
+   *
+   * We compose what needs to happen during the events
+   * using async.seq, which nests the calls the functions
+   * in order, passing the same context to all of them.
+   */
+
+    // startup
+  seneca.add({init: pluginName},
+    async.seq(pingCluster, ensureIndex, putMappings));
+
+  function pingCluster(args, cb) {
+    esClient.ping({
+      requestTimeout: 1000,
+      // undocumented params are appended to the query string
+      hello: "elasticsearch!"
+    }, function (error) {
+      if (error) {
+        cb(error, undefined);
+      } else {
+        cb(undefined, args);
+      }
+    });
+  }
 
   // index events
   seneca.add({role: pluginName, cmd: 'create-index'}, ensureIndex);
@@ -55,28 +85,42 @@ function search(options, register) {
   seneca.add({role: pluginName, cmd: 'load'},
     async.seq(populateRequest, loadRecord));
 
+  seneca.add({role: pluginName, cmd: 'count'},
+    async.seq(populateRequest, populateSearch, populateSearchBody, doCount, fetchEntitiesFromDB));
+
   seneca.add({role: pluginName, cmd: 'search'},
     async.seq(populateRequest, populateSearch, populateSearchBody, doSearch, fetchEntitiesFromDB));
 
   seneca.add({role: pluginName, cmd: 'remove'},
     async.seq(populateRequest, removeRecord));
 
+
   // entity events
-	// check if "base" is defined  in options and use it to call entity events if it is
-	if (_.isNull(options.base) || _.isEmpty(options.base) ||
-		_.isNaN(options.base) || _.isUndefined(options.base)) {
-		seneca.add({role: 'entity', cmd: 'save'},
-			async.seq(populateCommand, pickFields, entityPrior, entitySave, entityAct));
+  if(options.entities && options.entities.length > 0) {
+    for(var i = 0 ; i < options.entities.length ; i++) {
+      var entityDef = options.entities[i];
 
-		seneca.add({role: 'entity', cmd: 'remove'},
-			async.seq(populateCommand, entityRemove, entityPrior, entityAct));
-	} else {
-		seneca.add({role: 'entity', cmd: 'save', base: options.base},
-			async.seq(populateCommand, pickFields, entityPrior, entitySave, entityAct));
+      seneca.add(
+        augmentArgs({
+          role:'entity',
+          cmd:'save'
+        }, entityDef),
+        async.seq(populateCommand, entityPrior, pickFields, entitySave, entityAct));
 
-		seneca.add({role: 'entity', cmd: 'remove', base: options.base},
-			async.seq(populateCommand, entityRemove, entityPrior, entityAct));
-	}
+      seneca.add(
+        augmentArgs({
+          role:'entity',
+          cmd:'remove'
+        }, entityDef),
+        async.seq(populateCommand, entityRemove, entityPrior, entityAct));
+    }
+  } else {
+    seneca.add({role:'entity',cmd:'save'},
+      async.seq(populateCommand, entityPrior, pickFields, entitySave, entityAct));
+
+    seneca.add({role:'entity',cmd:'remove'},
+      async.seq(populateCommand, entityRemove, entityPrior, entityAct));
+  }
 
   register(null, {
     name: pluginName,
@@ -84,45 +128,43 @@ function search(options, register) {
   });
 
   /*
-  * Entity management
-  */
+   * Entity management
+   */
 
   function populateCommand(args, cb) {
     args.entityData = args.ent.data$();
     args.command = {
       role  : pluginName,
       index : connectionOptions.index,
-      type  : args.entityData.entity$.name
+      type  : entityNameFromObj(args.entityData.entity$),
     };
 
     cb(null, args);
   }
 
   function pickFields(args, cb) {
-    var data = args.ent.data$();
+    var data = args.entityResult.data$();
 
     // allow per-entity field configuration
-    var _type = args.command.type;
-    var _entities = options.entities || {};
-    var _fields = _entities[_type] || [];
+    var type = args.command.type;
+    var typeConfig = entitiesConfig[type];
+    var indexedAttributes = [];
+    if(typeConfig && typeConfig.indexedAttributes) {
+      indexedAttributes = typeConfig.indexedAttributes;
+    }
 
-    // always pass through _id if it exists
-    // TODO: reconsider this?
-    _fields.push('_id');
-
-
-    data = _.pick.apply(_, [data, _fields]);
+    data = _.pick(data, indexedAttributes);
+    data.entity$ = args.entityResult.entity$;
 
     args.entityData = data;
     cb(null, args);
   }
 
   function entitySave(args, cb) {
-    args.ent.id$ = args.ent.id$ || args.ent._id || args.ent.id || uuid.v4();
 
     args.command.cmd = 'save';
     args.command.data = args.entityData;
-    args.command.id = args.ent.id$;
+    args.command.id = args.entityData.id;
 
     cb(null, args);
   }
@@ -135,8 +177,12 @@ function search(options, register) {
 
   function entityPrior(args, cb) {
     this.prior(args, function(err, result) {
-      args.entityResult = result;
-      cb(null, args);
+      if(err) {
+        return cb(err, undefined);
+      } else {
+        args.entityResult = result;
+        cb(null, args);
+      }
     });
   }
 
@@ -153,8 +199,8 @@ function search(options, register) {
   }
 
   /*
-  * Index management.
-  */
+   * Index management.
+   */
   function hasIndex(args, cb) {
     esClient.indices.exists({index: args.index}, cb);
   }
@@ -174,9 +220,8 @@ function search(options, register) {
     assert.ok(args.index, 'missing args.index');
 
     hasIndex(args, onExists);
-
     function onExists(err, exists) {
-      if (err || !exists) {
+      if (!err && !exists) {
         createIndex(args, passArgs(args, cb));
       } else {
         cb(err, args);
@@ -184,31 +229,89 @@ function search(options, register) {
     }
   }
 
+  function entityNameFromObj(obj) {
+    var esName = '';
+    if(obj.zone) {
+      esName += obj.zone + '_';
+    }
+    if(obj.base) {
+      esName += obj.base + '_';
+    }
+    esName += obj.name || 'undefined';
+    return esName;
+  }
+
+  function entityNameFromStr(canonizedName) {
+    return canonizedName.replace('-/', '').replace('/', '_');
+  }
+
+  function putMappings(args, cb) {
+    var r = new ParallelRunner();
+    for(var entityType in entitiesConfig) {
+      var mapping = {};
+      var properties = {};
+      var hasProperties = false;
+      for(var prop in entitiesConfig[entityType].mapping) {
+        if(entitiesConfig[entityType].mapping[prop] !== true) {
+          properties[prop] = entitiesConfig[entityType].mapping[prop];
+          hasProperties = true;
+        }
+      }
+      properties.entity$ = {
+        type: 'string',
+        index: 'not_analyzed'
+      };
+      properties.id = {
+        type: 'string',
+        index: 'not_analyzed'
+      };
+      mapping[entityType] = {
+        properties: properties
+      };
+      r.add(putMapping, entityType, mapping);
+    }
+    r.run(function() {
+      cb();
+    });
+  }
+
+  function putMapping(type, mapping, cb) {
+    esClient.indices.putMapping({
+      index: connectionOptions.index,
+      type: type,
+      body: mapping
+    }, function(err, response) {
+      if(err) throw err
+      cb(undefined, response)
+    });
+  }
+
   /**
-  * Record management.
-  */
+   * Record management.
+   */
   function saveRecord(args, cb) {
-	  var skip = false;
+    var skip = false;
 
-	  //if filters are set in options, saveRecord will skip over records which accomplish the filter condition
-	  if (options.filters && options.filters[args.type]) {
-		  var filter = options.filters[args.type];
-		  _.each(filter, function (ex, key) {
-			  if (!((ex === args.data[key]) || ('' + args.data[key]).match(ex))) {
-				  skip = true;
-			  }
-		  })
-	  }
+    //if filters are set in options, saveRecord will skip over records which accomplish the filter condition
+    if (options.filters && options.filters[args.type]) {
+      var filter = options.filters[args.type];
+      _.each(filter, function (ex, key) {
+        if (!((ex === args.data[key]) || ('' + args.data[key]).match(ex))) {
+          skip = true;
+        }
+      })
+    }
 
-	  // We explicitly don't care about the seneca entity id$
-	  args.request.id = args.id || args.data._id;
+    if (skip) {
+      setImmediate(cb)
+    }
+    else {
+      // set the ES id as the entity id. We use it for 1-1 mapping between
+      // ES and the DB.
+      args.request.id = args.data.id;
 
-	  if (skip) {
-		  setImmediate(cb)
-	  }
-	  else {
-		  esClient.index(args.request, cb);
-	  }
+      esClient.index(args.request, cb);
+    }
   }
 
   function loadRecord(args, cb) {
@@ -229,89 +332,88 @@ function search(options, register) {
     esClient.search(args.request, cb);
   }
 
-	function fetchEntitiesFromDB(args, esResults, statusCode, cb) {
-		var seneca = this;
-		if(esResults && esResults.hits && esResults.hits.hits && esResults.hits.hits.length > 0) {
-			var hits = esResults.hits.hits;
+  function doCount(args, cb) {
+    esClient.count(args.request, cb);
+  }
 
-			var query = {
-				ids: []
-			}
+  function fetchEntitiesFromDB(esResults, statusCode, cb) {
+    var seneca = this;
+    if(esResults && esResults.hits && esResults.hits.hits && esResults.hits.hits.length > 0) {
+      var hits = esResults.hits.hits;
 
-			//must search in database through all types if search return multiple types results
-			var resultTypes = {};
+      var query = {
+        ids: []
+      }
 
-			_.each(hits, function(hit){
-				if(!resultTypes[hit._type]){
-					resultTypes[hit._type] = {
-						ids: [],
-						hits: []
-					};
-					resultTypes[hit._type].ids.push(hit._id);
-					resultTypes[hit._type].hits.push(hit);
-				} else {
-					resultTypes[hit._type].ids.push(hit._id);
-					resultTypes[hit._type].hits.push(hit);
-				}
-			});
+      //must search in database through all types if search return multiple types results
+      var resultTypes = {};
 
-			var totalHits = 0;
-			async.each(_.keys(resultTypes), function(type, next) {
+      _.each(hits, function(hit){
+        var esType = entityNameFromStr(hit._source.entity$);
+        if(!resultTypes[esType]){
+          resultTypes[esType] = {
+            type: hit._source.entity$,
+            ids: [],
+            hits: []
+          };
+          resultTypes[esType].ids.push(hit._id);
+          resultTypes[esType].hits.push(hit);
+        } else {
+          resultTypes[esType].ids.push(hit._id);
+          resultTypes[esType].hits.push(hit);
+        }
+      });
 
-				var base;
-				if(_.isNull(options.base) || _.isEmpty(options.base) ||
-					_.isNaN(options.base) || _.isUndefined(options.base)){
-					base = 'sys/';
-				} else {
-					base = options.base + '/';
-				}
-				var typeHelper = seneca.make(base + type);
+      var totalHits = 0;
+      async.each(_.keys(resultTypes), function(esType, next) {
 
-				query.ids = query.ids.concat(resultTypes[type].ids);
-				var hits = resultTypes[type].hits;
+        var typeHelper = seneca.make(resultTypes[esType].type);
 
-				typeHelper.list$(query, function(err, objects) {
-					if (err) {
-						return cb(err, undefined);
-					}
-					var databaseResults = objects;
-					if (databaseResults) {
-						// Go from high to low because we're splicing out of the array while we're iterating through it
-						for (var i = hits.length - 1; i >= 0; i--) {
-							hits[i]._source = _.find(databaseResults, function (item) {
-								return hits[i]._id === item.id;
-							});
-							if (!hits[i]._source) {
-								hits.splice(i, 1);
-								esResults.hits.total -= 1;
-							}
-						}
+        query.ids = query.ids.concat(resultTypes[esType].ids);
+        var hits = resultTypes[esType].hits;
 
-						resultTypes[type].hits = hits;
-					}
-					totalHits += esResults.hits.total;
-					next();
-				});
-			}, function(err){
-				if(err) {
-					if (err) { return seneca.fail(err); }
-				} else {
-					esResults.hits.hits = [];
-					_.each(_.keys(resultTypes), function(type){
-						esResults.hits.hits = esResults.hits.hits.concat(resultTypes[type].hits);
-					});
-					esResults.hits.total = totalHits;
-					cb(undefined, esResults);
-				}
-			});
-		} else {
-			cb(undefined, esResults);
-		}
-	}
+        typeHelper.list$(query, function(err, objects) {
+          if (err) {
+            return cb(err, undefined);
+          }
+          var databaseResults = objects;
+          if (databaseResults) {
+            // Go from high to low because we're splicing out of the array while we're iterating through it
+            for (var i = hits.length - 1; i >= 0; i--) {
+              hits[i]._source = _.find(databaseResults, function (item) {
+                return hits[i]._id === item.id;
+              });
+              if (!hits[i]._source) {
+                hits.splice(i, 1);
+                esResults.hits.total -= 1;
+              }
+            }
+
+            resultTypes[esType].hits = hits;
+          }
+          totalHits += esResults.hits.total;
+          next();
+        });
+      }, function(err){
+        if(err) {
+          if (err) { return seneca.fail(err); }
+        } else {
+          esResults.hits.hits = [];
+          _.each(_.keys(resultTypes), function(esType){
+            esResults.hits.hits = esResults.hits.hits.concat(resultTypes[esType].hits);
+          });
+          esResults.hits.total = totalHits;
+          cb(undefined, esResults);
+        }
+      });
+    } else {
+      cb(undefined, esResults);
+    }
+  }
 
   /**
-  * Constructing requests.
-  */
+   * Constructing requests.
+   */
 
   function populateBody(args, cb) {
     args.request.body = args.data;
@@ -342,11 +444,11 @@ function search(options, register) {
   function populateRequest(args, cb) {
     assert.ok(args.data || args.type, 'missing args.data and args.type');
 
-    var dataType = args.type || args.data.entity$;
+    var dataType = args.type || entityNameFromStr(args.data.entity$);
     assert.ok(dataType, 'expected either "type" or "data.entity$" to deduce the entity type');
 
     args.request = {
-      index: args.index,
+      index: args.index || connectionOptions.index,
       type: dataType,
       refresh: options.refreshOnSave
     };
@@ -358,9 +460,21 @@ function search(options, register) {
   function passArgs(args, cb) {
     return function (err, resp) {
       if (err) { return seneca.fail(err); }
-
       cb(err, args);
     }
+  }
+
+  function augmentArgs(args, entityDef) {
+    if(entityDef.zone) {
+      args.zone = entityDef.zone;
+    }
+    if(entityDef.base) {
+      args.base = entityDef.base;
+    }
+    if(entityDef.name) {
+      args.name = entityDef.name;
+    }
+    return args;
   }
 
 }
